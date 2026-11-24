@@ -1,0 +1,53 @@
+name: Build (aarch64-android)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Build (release)
+        env:
+          NDK_BIN: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+        run: cargo build --target aarch64-linux-android --release
+
+      - name: Strip binary
+        run: |
+          NDK_STRIP="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          "$NDK_STRIP" target/aarch64-linux-android/release/vendor_xiaomi_hardware_displayfeature_service
+          ls -lh target/aarch64-linux-android/release/vendor_xiaomi_hardware_displayfeature_service
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: displayfeature-service-aarch64
+          path: target/aarch64-linux-android/release/vendor_xiaomi_hardware_displayfeature_service
+          if-no-files-found: error
+
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/aarch64-linux-android/release/vendor_xiaomi_hardware_displayfeature_service

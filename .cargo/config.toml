@@ -1,0 +1,7 @@
+[target.aarch64-linux-android]
+# Requires Android NDK (r26+). Either put the NDK llvm toolchain bin dir on PATH,
+# or override via environment:
+#   export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=/path/to/ndk/.../bin/aarch64-linux-android33-clang
+#   export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=/path/to/ndk/.../bin/llvm-ar
+linker = "aarch64-linux-android33-clang"
+ar = "llvm-ar"
