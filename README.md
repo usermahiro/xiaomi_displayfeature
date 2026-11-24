@@ -57,13 +57,17 @@ The framework's `DisplayFeatureManagerService` sends animated `setFeature` ramps
 |---|---|---|---|
 | `24` | DFPS / refresh rate | Hz (cookie 255 = user selection) | peak/min refresh rate batch write |
 | `3` | Reading / paper mode | CT level 0 = off, 0..255 = strength | `setNightDisplayActivated` + `setNightDisplayColorTemperature` (6500K → 2500K warm paper tint) |
-| `2` | Color scheme level | 0 / 1 / 2 | `setSaturationLevel(100/85/70)` |
+| `0`, `1`, `2`, `23` | Color mode / color scheme | presets 1=warm, 2=natural, 3=cool; custom values are packed ARGB from MIUI's color picker (`ScreenColorAlgorithm.encode`) | decoded R-B delta mapped to night-display colour temperature (2500K..9000K), saturation kept normal |
 | `31` | Paper color type (hitam-putih / grayscale) | 2 = grayscale, 0 = off | `setSaturationLevel(0)` |
 
 Verified `IColorDisplayManager` transaction codes (AOSP `IColorDisplayManager.aidl` order):
 `2`=setSaturationLevel, `7`=setNightDisplayActivated, `9`=setNightDisplayColorTemperature.
 
-`setColorMode` (code 18) is rejected by MIUI's `ColorDisplayService` ("Invalid colorMode") and therefore not used.
+MIUI's colour picker (`ScreenColorBitMapView`) writes a packed ARGB pixel to
+`screen_color_level`. The bridge decodes R-B and drives `IColorDisplayManager`
+night-display temperature, so warm/cool/custom colour modes are visible.
+`setColorMode` (code 18) is rejected by MIUI's `ColorDisplayService`
+("Invalid colorMode") and therefore still not used.
 
 ---
 

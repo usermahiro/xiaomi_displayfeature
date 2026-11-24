@@ -27,8 +27,10 @@ enum RateCommand {
 ///   9 = setNightDisplayColorTemperature(int, Kelvin)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScreenCommand {
-    /// mode=2: MIUI color-scheme level (screen_color_level 0/1/2) -> global saturation.
-    ColorLevel(i32),
+    /// MIUI color-scheme / unlimited-color value.
+    /// Presets 1=warm, 2=nature, 3=cool; custom values are packed ARGB
+    /// (ScreenColorAlgorithm.encode of the picked bitmap pixel).
+    ColorPacked(i32),
     /// mode=3: reading/paper mode CT level (0 = off, >0 = warm tint strength).
     ReadingCt(i32),
     /// mode=31: paper color type — 2 = grayscale (hitam-putih), 0 = off.
@@ -198,39 +200,53 @@ fn ct_level_to_kelvin(level: i32) -> i32 {
     6500 - ((level as i64 * 4000) / 255) as i32
 }
 
-/// Map MIUI color-scheme level (screen_color_level 0/1/2) to saturation percent
-/// (IColorDisplayManager.setSaturationLevel: 100 = normal, 0 = grayscale).
-fn color_level_to_saturation(level: i32) -> i32 {
-    match level {
-        0 => 100,
-        1 => 85,
-        2 => 70,
-        _ => 100,
-    }
-}
-
-// Shared saturation state: grayscale (mode=31) overrides color level (mode=2).
+// Shared saturation state: grayscale (mode=31) overrides color mode.
 static GRAYSCALE_ON: AtomicI32 = AtomicI32::new(0);
-static COLOR_LEVEL: AtomicI32 = AtomicI32::new(0);
 
 fn push_saturation() {
-    let gray = GRAYSCALE_ON.load(Ordering::SeqCst) > 0;
-    let sat = if gray {
-        tracing::info!("[DisplayFeature-Color] Grayscale ON -> setSaturationLevel(0)");
-        0
-    } else {
-        let level = COLOR_LEVEL.load(Ordering::SeqCst);
-        let s = color_level_to_saturation(level);
-        tracing::info!("[DisplayFeature-Color] Grayscale OFF, ColorLevel {} -> setSaturationLevel({})", level, s);
-        s
-    };
+    let sat = if GRAYSCALE_ON.load(Ordering::SeqCst) > 0 { 0 } else { 100 };
     let sat_str = sat.to_string();
     color_display_call(&[&TX_SET_SATURATION.to_string(), "i32", &sat_str]);
 }
 
-fn apply_color_level(level: i32) {
-    COLOR_LEVEL.store(level, Ordering::SeqCst);
+/// MIUI's custom color picker stores a packed ARGB pixel in
+/// `screen_color_level` (ScreenColorAlgorithm.encode). Presets are the small
+/// values 1=warm, 2=natural, 3=cool. Translate both to a night-display
+/// colour temperature so the mode is actually visible on a ported ROM.
+fn apply_color_packed(value: i32) {
+    let delta = if (0..=3).contains(&value) {
+        match value {
+            1 => 60,   // warm preset
+            3 => -60,  // cool preset
+            _ => 0,    // natural / default
+        }
+    } else {
+        let argb = value as u32;
+        let r = (argb >> 16) & 0xff;
+        let b = argb & 0xff;
+        r as i32 - b as i32
+    };
+
+    // Grayscale must stay grayscale regardless of the picked colour.
     push_saturation();
+
+    let active_tx = TX_SET_NIGHT_ACTIVE.to_string();
+    if delta.abs() <= 3 {
+        tracing::info!("[DisplayFeature-Color] ColorPacked({}) -> natural, NightDisplay OFF", value);
+        color_display_call(&[&active_tx, "i32", "0"]);
+        return;
+    }
+
+    let kelvin = (6500i32 - delta.saturating_mul(100)).clamp(2500, 9000);
+    tracing::info!(
+        "[DisplayFeature-Color] ColorPacked({}) -> NightDisplay ON @ {}K (r-b={})",
+        value, kelvin, delta
+    );
+    let temp_tx = TX_SET_NIGHT_TEMP.to_string();
+    let temp = kelvin.to_string();
+    // Set temperature before activation so the tint appears in one frame.
+    color_display_call(&[&temp_tx, "i32", &temp]);
+    color_display_call(&[&active_tx, "i32", "1"]);
 }
 
 fn apply_paper_color_type(value: i32) {
@@ -294,7 +310,7 @@ fn init_screen_worker() {
 
             if Some(&final_cmd) != last_applied.as_ref() {
                 match final_cmd {
-                    ScreenCommand::ColorLevel(v) => apply_color_level(v),
+                    ScreenCommand::ColorPacked(v) => apply_color_packed(v),
                     ScreenCommand::ReadingCt(v) => apply_reading_ct(v),
                     ScreenCommand::PaperColorType(v) => apply_paper_color_type(v),
                 }
@@ -407,9 +423,10 @@ impl IDisplayFeature for DisplayFeatureService {
             for cb in callbacks {
                 let _ = cb.r#displayfeatureInfoChanged(displayId, mode, value as f32, 0.0, 0.0);
             }
-        } else if mode == 2 {
-            // mode 2 = MIUI color-scheme level (screen_color_level 0/1/2)
-            request_screen_effect(ScreenCommand::ColorLevel(value));
+        } else if mode == 0 || mode == 1 || mode == 2 || mode == 23 {
+            // MIUI colour-scheme modes: 0/1/2 = adapt/enhance/standard,
+            // 23 = unlimited colour level (packed ARGB from the colour picker).
+            request_screen_effect(ScreenCommand::ColorPacked(value));
             let callbacks = self.callbacks.lock().clone();
             for cb in callbacks {
                 let _ = cb.r#displayfeatureInfoChanged(displayId, mode, value as f32, 0.0, 0.0);
