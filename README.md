@@ -38,7 +38,7 @@ This mock service solves these issues natively by registering with Android `serv
 1. **Dynamic vs. Locked Refresh Rate**:
    - **Auto Mode** (`is_smart_fps == 1`): Sets `peak=120.0`, `min=60.0`, allowing PowerKeeper animation boosts (`cookie=244`) for smooth adaptive refresh rates.
    - **Custom 60Hz Mode**: Sets both `peak=60.0` and `min=60.0`, gating PowerKeeper boosts to prevent gesture animations from overriding 60Hz.
-   - **Custom 120Hz Mode**: Sets both `peak=120.0` and `min=120.0`, preventing MediaTek HWC from dropping frames while idle.
+   - **Custom 120Hz / 144Hz Mode**: Sets `peak=120.0` (or `144.0`) and keeps `min=60.0`, so the panel can idle at 60Hz instead of running hot continuously. Only the explicit 60Hz selection pins `min=60.0` as well, to gate PowerKeeper boosts.
    - **144Hz panels**: user selection up to 144Hz is persisted and restored at boot.
 2. **Sequential Worker Queue**:
    - Rapid consecutive taps (e.g. 60 $\leftrightarrow$ 120) drain intermediate backlog events to apply only the final target state, completely preventing thread race conditions.

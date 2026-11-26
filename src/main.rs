@@ -101,13 +101,21 @@ fn is_smart_fps_mode() -> bool {
     false
 }
 
-fn apply_settings_batch(hz: i32, is_user_selection: bool) {
-    let is_smart = is_smart_fps_mode();
-    let min_hz = if is_smart {
+/// Only pin the minimum to the requested rate when the user explicitly wants
+/// 60Hz: that is what stops PowerKeeper boosts from reverting to 120Hz.
+/// For any higher rate the minimum must stay at 60 so the panel can idle at
+/// 60Hz; locking it at 120 keeps the GPU/CPU hot and causes thermal lag.
+fn min_refresh_rate(hz: i32, is_smart: bool) -> i32 {
+    if is_smart || hz > 60 {
         60
     } else {
-        hz // in custom mode, lock minimum to requested rate (e.g. 60Hz -> min 60; 120Hz -> min 120)
-    };
+        hz
+    }
+}
+
+fn apply_settings_batch(hz: i32, is_user_selection: bool) {
+    let is_smart = is_smart_fps_mode();
+    let min_hz = min_refresh_rate(hz, is_smart);
 
     let peak_str = format!("{}.0", hz);
     let min_str = format!("{}.0", min_hz);
@@ -639,5 +647,14 @@ mod tests {
     fn decode_neutral_is_gray() {
         let (r, g, b) = decode_color(0xff808080u32 as i32);
         assert!(r.abs_diff(g) <= 2 && g.abs_diff(b) <= 2, "{r},{g},{b}");
+    }
+
+    #[test]
+    fn higher_rates_keep_min_at_60() {
+        assert_eq!(min_refresh_rate(60, false), 60);
+        assert_eq!(min_refresh_rate(90, false), 60);
+        assert_eq!(min_refresh_rate(120, false), 60);
+        assert_eq!(min_refresh_rate(144, false), 60);
+        assert_eq!(min_refresh_rate(120, true), 60);
     }
 }
