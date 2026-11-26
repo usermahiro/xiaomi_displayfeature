@@ -41,6 +41,36 @@ const TX_SET_SATURATION: u32 = 2;
 const TX_SET_NIGHT_ACTIVE: u32 = 7;
 const TX_SET_NIGHT_TEMP: u32 = 9;
 
+/// MIUI's `screen_optimize_mode` 1/2/3/4 reaches the HAL as setFeature
+/// mode 0/1/2/23. Each maps to a different native SurfaceFlinger colour mode.
+fn native_color_mode(mode: i32) -> i32 {
+    match mode {
+        0 => 1, // Vivid / adapt
+        1 => 2, // Enhanced
+        2 => 0, // Original colour PRO / standard
+        _ => 0, // custom colour level
+    }
+}
+
+/// Mirror DisplayFeatureManagerService.notifySFColorMode(): the framework
+/// writes display_color_mode, sets the native-mode property, then sends
+/// transaction 31023 to SurfaceFlinger. Doing it here keeps Vivid /
+/// Original working even when no framework callback is registered.
+fn notify_sf_color_mode(mode: i32) {
+    let script = format!(
+        "/system/bin/settings put system display_color_mode {m} ; \
+         /system/bin/setprop persist.sys.sf.native_mode {m} ; \
+         /system/bin/service call SurfaceFlinger 31023 i32 {m}",
+        m = mode
+    );
+    if let Err(e) = std::process::Command::new("/system/bin/sh")
+        .args(["-c", &script])
+        .status()
+    {
+        tracing::warn!("[DisplayFeature] notifySFColorMode({}) failed: {}", mode, e);
+    }
+}
+
 static WORKER_TX: RwLock<Option<Sender<RateCommand>>> = RwLock::new(None);
 static SCREEN_TX: RwLock<Option<Sender<ScreenCommand>>> = RwLock::new(None);
 static USER_TARGET_FPS: AtomicI32 = AtomicI32::new(120);
@@ -203,55 +233,141 @@ fn ct_level_to_kelvin(level: i32) -> i32 {
 // Shared saturation state: grayscale (mode=31) overrides color mode.
 static GRAYSCALE_ON: AtomicI32 = AtomicI32::new(0);
 
-fn push_saturation() {
-    let sat = if GRAYSCALE_ON.load(Ordering::SeqCst) > 0 { 0 } else { 100 };
+fn push_saturation(normal: i32) {
+    let sat = if GRAYSCALE_ON.load(Ordering::SeqCst) > 0 {
+        0
+    } else {
+        normal.clamp(0, 100)
+    };
     let sat_str = sat.to_string();
     color_display_call(&[&TX_SET_SATURATION.to_string(), "i32", &sat_str]);
 }
 
-/// MIUI's custom color picker stores a packed ARGB pixel in
-/// `screen_color_level` (ScreenColorAlgorithm.encode). Presets are the small
-/// values 1=warm, 2=natural, 3=cool. Translate both to a night-display
-/// colour temperature so the mode is actually visible on a ported ROM.
+fn srgb_to_linear(c: u8) -> f64 {
+    let c = c as f64 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn rgb_to_lab(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
+    let (rl, gl, bl) = (srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b));
+    let x = (0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl) / 0.950456;
+    let y = 0.2126729 * rl + 0.7151522 * gl + 0.072175 * bl;
+    let z = (0.0193339 * rl + 0.119192 * gl + 0.9503041 * bl) / 1.088754;
+    let f = |t: f64| {
+        if t > 0.008856 {
+            t.cbrt()
+        } else {
+            t * 7.787 + 0.137931
+        }
+    };
+    (116.0 * f(y) - 16.0, 500.0 * (f(x) - f(y)), 200.0 * (f(y) - f(z)))
+}
+
+fn lab_to_rgb(l: f64, a: f64, b: f64) -> (u8, u8, u8) {
+    let fy = (l + 16.0) / 116.0;
+    let fx = a / 500.0 + fy;
+    let fz = fy - b / 200.0;
+    let f = |t: f64| {
+        if t > 0.206896552 {
+            t * t * t
+        } else {
+            (t - 0.137931) / 7.787
+        }
+    };
+    let x = f(fx) * 0.950456;
+    let y = f(fy);
+    let z = f(fz) * 1.088754;
+    let r = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
+    let g = -0.969266 * x + 1.8760108 * y + 0.041556 * z;
+    let b = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+    let enc = |c: f64| {
+        let c = c.max(0.0).min(1.0);
+        let c = if c <= 0.0031308 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (c * 255.0).round() as u8
+    };
+    (enc(r), enc(g), enc(b))
+}
+
+/// Inverse of MIUI's ScreenColorAlgorithm.encode(): recover the picked pixel
+/// from the encoded `screen_color_level`.
+fn decode_color(value: i32) -> (u8, u8, u8) {
+    let argb = value as u32;
+    let r = ((argb >> 16) & 0xff) as u8;
+    let g = ((argb >> 8) & 0xff) as u8;
+    let b = (argb & 0xff) as u8;
+    let (l, a, bb) = rgb_to_lab(r, g, b);
+    let angle = bb.atan2(a);
+    let magnitude = (a * a + bb * bb).sqrt();
+    let expanded = (magnitude / 7.0).exp() - 1.0;
+    let a2 = (angle.cos() * expanded).clamp(-128.0, 128.0);
+    let b2 = (angle.sin() * expanded).clamp(-128.0, 128.0);
+    lab_to_rgb(l, a2, b2)
+}
+
+fn color_saturation(green_axis: f64) -> i32 {
+    if green_axis < -8.0 {
+        (100.0 - ((-green_axis) / 6.0).min(20.0)).round() as i32
+    } else {
+        100
+    }
+}
+
+/// MIUI's custom color picker stores a packed Lab value in
+/// `screen_color_level`. Only two controls exist on this port: NightDisplay
+/// (2596..4082K, yellow/blue axis) and saturation (0..100). Use the decoded
+/// blue-yellow axis for temperature and the red-green axis for saturation,
+/// so more of the wheel produces a visible change than r-b alone did.
 fn apply_color_packed(value: i32) {
-    let delta = if (0..=3).contains(&value) {
+    let (delta, green_axis) = if (0..=3).contains(&value) {
         match value {
-            1 => 60,   // warm preset
-            3 => -60,  // cool preset
-            _ => 0,    // natural / default
+            1 => (60.0, 0.0),  // warm preset
+            3 => (-60.0, 0.0), // cool preset
+            _ => (0.0, 0.0),   // natural / default
         }
     } else {
-        let argb = value as u32;
-        let r = (argb >> 16) & 0xff;
-        let b = argb & 0xff;
-        r as i32 - b as i32
+        let (r, g, b) = decode_color(value);
+        let (_, a, bb) = rgb_to_lab(r, g, b);
+        (bb as f64, a as f64)
     };
 
-    // Grayscale must stay grayscale regardless of the picked colour.
-    push_saturation();
+    // Green/cyan side: reduce saturation so that half of the wheel is not
+    // identical to neutral. Clamped so it never goes grayscale here.
+    let normal_sat = color_saturation(green_axis);
+    push_saturation(normal_sat);
 
     let active_tx = TX_SET_NIGHT_ACTIVE.to_string();
-    if delta.abs() <= 3 {
-        tracing::info!("[DisplayFeature-Color] ColorPacked({}) -> natural, NightDisplay OFF", value);
+    if delta.abs() <= 3.0 {
+        tracing::info!(
+            "[DisplayFeature-Color] ColorPacked({}) -> natural, NightDisplay OFF (sat={})",
+            value,
+            normal_sat
+        );
         color_display_call(&[&active_tx, "i32", "0"]);
         return;
     }
 
-    let kelvin = (6500i32 - delta.saturating_mul(100)).clamp(2500, 9000);
+    let kelvin = (6500i32 - (delta.round() as i32).saturating_mul(100)).clamp(2500, 9000);
     tracing::info!(
-        "[DisplayFeature-Color] ColorPacked({}) -> NightDisplay ON @ {}K (r-b={})",
-        value, kelvin, delta
+        "[DisplayFeature-Color] ColorPacked({}) -> NightDisplay {}K (b*={:.0}, a*={:.0}, sat={})",
+        value, kelvin, delta, green_axis, normal_sat
     );
-    let temp_tx = TX_SET_NIGHT_TEMP.to_string();
     let temp = kelvin.to_string();
     // Set temperature before activation so the tint appears in one frame.
-    color_display_call(&[&temp_tx, "i32", &temp]);
+    color_display_call(&[&TX_SET_NIGHT_TEMP.to_string(), "i32", &temp]);
     color_display_call(&[&active_tx, "i32", "1"]);
 }
 
 fn apply_paper_color_type(value: i32) {
     GRAYSCALE_ON.store(if value > 0 { 1 } else { 0 }, Ordering::SeqCst);
-    push_saturation();
+    push_saturation(100);
 }
 
 fn apply_reading_ct(level: i32) {
@@ -424,9 +540,12 @@ impl IDisplayFeature for DisplayFeatureService {
                 let _ = cb.r#displayfeatureInfoChanged(displayId, mode, value as f32, 0.0, 0.0);
             }
         } else if mode == 0 || mode == 1 || mode == 2 || mode == 23 {
-            // MIUI colour-scheme modes: 0/1/2 = adapt/enhance/standard,
-            // 23 = unlimited colour level (packed ARGB from the colour picker).
+            // MIUI colour-scheme modes. `value` is the colour-temperature
+            // level (screen_color_level); the mode itself selects Vivid /
+            // Enhanced / Original and must be forwarded to SurfaceFlinger.
             request_screen_effect(ScreenCommand::ColorPacked(value));
+
+            notify_sf_color_mode(native_color_mode(mode));
             let callbacks = self.callbacks.lock().clone();
             for cb in callbacks {
                 let _ = cb.r#displayfeatureInfoChanged(displayId, mode, value as f32, 0.0, 0.0);
@@ -491,4 +610,34 @@ fn main() -> anyhow::Result<()> {
     tracing::info!("Registered {} successfully. Joining thread pool...", SERVICE_NAME);
     rsbinder::ProcessState::join_thread_pool()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colour_scheme_modes_map_to_native_modes() {
+        // DisplayFeatureManagerService.handleScreenSchemeChange():
+        // screen_optimize_mode 1/2/3/4 -> setFeature mode 0/1/2/23.
+        assert_eq!(native_color_mode(0), 1); // Vivid
+        assert_eq!(native_color_mode(1), 2); // Enhanced
+        assert_eq!(native_color_mode(2), 0); // Original colour PRO
+        assert_eq!(native_color_mode(23), 0); // custom
+        assert_eq!(native_color_mode(99), 0); // unknown stays neutral
+    }
+
+    #[test]
+    fn green_axis_changes_saturation() {
+        assert_eq!(color_saturation(50.0), 100);
+        assert_eq!(color_saturation(-2.0), 100);
+        assert_eq!(color_saturation(-60.0), 90);
+        assert_eq!(color_saturation(-200.0), 80);
+    }
+
+    #[test]
+    fn decode_neutral_is_gray() {
+        let (r, g, b) = decode_color(0xff808080u32 as i32);
+        assert!(r.abs_diff(g) <= 2 && g.abs_diff(b) <= 2, "{r},{g},{b}");
+    }
 }

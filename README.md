@@ -49,7 +49,7 @@ This mock service solves these issues natively by registering with Android `serv
 
 ---
 
-## Screen Effects (mode 2 / 3 / 31) — ColorDisplayManager Bridge
+## Screen Effects (mode 0 / 1 / 2 / 3 / 23 / 31) — ColorDisplayManager Bridge
 
 The framework's `DisplayFeatureManagerService` sends animated `setFeature` ramps (~200 calls per toggle). The mock coalesces them with a 150 ms debounce window and translates the final state into `IColorDisplayManager` (`color_display` service) binder calls — executed as root uid 0 via `/system/bin/service`, which satisfies the `CONTROL_DISPLAY_COLOR_TRANSFORMS` signature permission.
 
@@ -57,17 +57,32 @@ The framework's `DisplayFeatureManagerService` sends animated `setFeature` ramps
 |---|---|---|---|
 | `24` | DFPS / refresh rate | Hz (cookie 255 = user selection) | peak/min refresh rate batch write |
 | `3` | Reading / paper mode | CT level 0 = off, 0..255 = strength | `setNightDisplayActivated` + `setNightDisplayColorTemperature` (6500K → 2500K warm paper tint) |
-| `0`, `1`, `2`, `23` | Color mode / color scheme | presets 1=warm, 2=natural, 3=cool; custom values are packed ARGB from MIUI's color picker (`ScreenColorAlgorithm.encode`) | decoded R-B delta mapped to night-display colour temperature (2500K..9000K), saturation kept normal |
+| `0`, `1`, `2`, `23` | Colour scheme (Vivid / Enhanced / Original / custom) | `screen_optimize_mode` 1/2/3/4 becomes mode 0/1/2/23; `value` is `screen_color_level` | native SurfaceFlinger colour mode 1/2/0/0 plus night-display tint and saturation from the decoded Lab colour |
 | `31` | Paper color type (hitam-putih / grayscale) | 2 = grayscale, 0 = off | `setSaturationLevel(0)` |
+
+### Colour scheme and the colour wheel
+
+MIUI keeps two separate settings:
+
+- `screen_optimize_mode` selects **Vivid / Original color PRO**. Framework
+  `handleScreenSchemeChange()` maps it to `setFeature` mode 0/1/2/23.
+  The HAL now mirrors `notifySFColorMode()`: it writes `display_color_mode`,
+  sets `persist.sys.sf.native_mode`, and sends SurfaceFlinger transaction
+  31023. This is what makes Vivid and Original actually different.
+- `screen_color_level` is the wheel colour, encoded by
+  `ScreenColorAlgorithm.encode()` (Lab-based, not plain ARGB). The bridge
+  decodes it with the inverse Lab transform, then uses the available controls:
+  blue-yellow axis (`b*`) drives night-display temperature, red-green axis
+  (`a*`) drives saturation.
 
 Verified `IColorDisplayManager` transaction codes (AOSP `IColorDisplayManager.aidl` order):
 `2`=setSaturationLevel, `7`=setNightDisplayActivated, `9`=setNightDisplayColorTemperature.
 
-MIUI's colour picker (`ScreenColorBitMapView`) writes a packed ARGB pixel to
-`screen_color_level`. The bridge decodes R-B and drives `IColorDisplayManager`
-night-display temperature, so warm/cool/custom colour modes are visible.
-`setColorMode` (code 18) is rejected by MIUI's `ColorDisplayService`
-("Invalid colorMode") and therefore still not used.
+**Hardware limit:** night display on this panel only accepts 2596–4082K.
+Cool requests clamp to 4082K, so blue/cyan cannot become truly blue, and the
+red-green axis can only change saturation, not hue. Full-wheel colour needs
+the vendor PQ/matrix path, which this port does not provide. `setColorMode`
+(code 18) is rejected by `ColorDisplayService` ("Invalid colorMode").
 
 ---
 
